@@ -1,0 +1,53 @@
+Revised Software Specification: X3D Skin Weight Line-of-Sight Culler
+1. Overview
+
+The X3D Skin Weight Line-of-Sight Culler is a client-side JavaScript tool designed to optimize standard H-Anim rigging within X3D files. It solves "weight bleeding" by performing 3D raycast line-of-sight checks between skeletal joint centers and skin vertices. It features a "clean slate" mechanism that entirely scrubs the XML DOM of previous rigging properties before rebuilding it, ensuring that no malformed XML structures or legacy ghost weights persist.
+2. Inputs & Outputs
+
+    Input: .x3d or .xml containing an H-Anim skeleton and <IndexedFaceSet> skin geometry.
+
+    Output: Processed .x3d file appended with _Culled.x3d.
+
+    Execution: 100% client-side via HTML5 FileReader and DOM APIs.
+
+3. Core Processing Rules
+
+Phase 1: Memory Caching & Total DOM Scrubbing
+
+    Locates skin coordinates and triangulates all mesh polygon <IndexedFaceSet> nodes into triangles.
+
+    Traverses every <HAnimJoint> in the document.
+
+    Caches the initial relationships from skinCoordIndex and skinCoordWeight into a highly-optimized multidimensional memory object.
+
+    Scrubbing: Immediately triggers .removeAttribute() on skinCoordIndex and skinCoordWeight across every joint in the XML Document. This guarantees the algorithm builds on a completely blank canvas.
+
+Phase 2: Raycast Line-of-Sight Culling
+For every cached joint-to-vertex relationship:
+
+    A vector ray is cast from the joint's center to the target vertex.
+
+    The ray must only touch the center and the target point. It is tested against the mesh triangles using the Möller–Trumbore intersection algorithm (heavily optimized via AABB collision pruning).
+
+    If the ray intersects a triangle before reaching the endpoint (a boundary/mesh crossing), it flags the relationship as occluded.
+
+Phase 3: The Orphan Exception Rule
+
+    Evaluates all occlusion flags.
+
+    If a vertex has at least one valid, unoccluded joint mapped to it, all occluded joints mapped to that vertex are permanently deleted from memory.
+
+    If removing the occlusions would leave the vertex completely untethered from standard joints (an "orphan"), the rule breaks: it keeps the occluded joint that originally had the highest weight and deletes the rest.
+
+Phase 4: Output Dictionary Reversal & Normalization
+
+    Standard weights for every vertex are recalculated (New_Weight = Old_Weight / Sum_of_Remaining_Weights). Total equals 1.0.
+
+    The dictionary is fundamentally inverted from a Vertex -> Joint structure back into a Joint -> Vertex Array structure formatted to 5 decimal floating points for clean XML serialization.
+
+Phase 5: Re-injection & Root Joint Logic
+The script loops through the blank XML DOM joints a final time:
+
+    humanoid_root: Completely bypasses caching/normalization logic. It is forcibly assigned a skinCoordIndex string containing every vertex in the mesh (0 to n), with matching weights of exactly 1.0. Resulting in a total mesh weight of 2.0.
+
+    Standard Bones: Injects the newly calculated skinCoordIndex and skinCoordWeight arrays. Bones that lost all their vertices naturally remain blank.

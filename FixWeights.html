@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>X3D Skin Weight Fixer & Normalizer</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; background: #f4f4f9; }
+        .container { max-width: 600px; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        button { padding: 10px 15px; background: #0078D7; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-top: 15px;}
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #status { margin-top: 20px; font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>X3D Skin Weight Fixer</h2>
+    <p>Select your X3D file. This script will find vertices shared between the hips and arms, correct them based on their 3D coordinates, normalize the weights to 1.0, and download the fixed file.</p>
+    
+    <input type="file" id="fileInput" accept=".x3d,.xml" />
+    <br>
+    <button id="processBtn" disabled>Process and Download</button>
+    <div id="status"></div>
+</div>
+
+<script>
+    const fileInput = document.getElementById('fileInput');
+    const processBtn = document.getElementById('processBtn');
+    const statusDiv = document.getElementById('status');
+    let xmlDoc = null;
+    let originalFilename = "fixed_model.x3d";
+
+    fileInput.addEventListener('change', function(e) {
+        if (e.target.files.length > 0) {
+            originalFilename = e.target.files[0].name.replace('.x3d', '_Fixed.x3d');
+            processBtn.disabled = false;
+        }
+    });
+
+    processBtn.addEventListener('click', function() {
+        const file = fileInput.files[0];
+        const reader = new FileReader();
+        
+        statusDiv.innerText = "Processing... Please wait.";
+        
+        reader.onload = function(e) {
+            const parser = new DOMParser();
+            xmlDoc = parser.parseFromString(e.target.result, "text/xml");
+            
+            fixWeights(xmlDoc);
+            
+            const serializer = new XMLSerializer();
+            let outStr = serializer.serializeToString(xmlDoc);
+            
+            // Re-add the XML declaration if it was stripped
+            if (!outStr.startsWith("<?xml")) {
+                outStr = "<?xml version='1.0' encoding='utf-8'?>\n" + outStr;
+            }
+
+            const blob = new Blob([outStr], { type: "text/xml" });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = originalFilename;
+            a.click();
+            URL.revokeObjectURL(url);
+            
+            statusDiv.innerText = "Done! File downloaded as " + originalFilename;
+        };
+        
+        reader.readAsText(file);
+    });
+
+    function fixWeights(doc) {
+        // 1. Extract 3D Coordinates
+        const coordNode = doc.querySelector('Coordinate[DEF="SkinCoord"]');
+        const pointsStr = coordNode.getAttribute('point').trim().split(/\s+/);
+        const coords = [];
+        for (let i = 0; i < pointsStr.length; i += 3) {
+            coords.push(parseFloat(pointsStr[i])); // We only strictly need the X coordinate
+        }
+
+        // 2. Build Vertex -> { JointName : Weight } mapping
+        const joints = doc.querySelectorAll('HAnimJoint');
+        let vertexWeights = {};
+        
+        joints.forEach(joint => {
+            const idxStr = joint.getAttribute('skinCoordIndex');
+            const wtStr = joint.getAttribute('skinCoordWeight');
+            if (!idxStr || !wtStr) return;
+            
+            const indices = idxStr.trim().split(/\s+/).map(Number);
+            const weights = wtStr.trim().split(/\s+/).map(Number);
+            
+            for (let i = 0; i < indices.length; i++) {
+                let vIdx = indices[i];
+                if (!vertexWeights[vIdx]) vertexWeights[vIdx] = {};
+                vertexWeights[vIdx][joint.getAttribute('name')] = weights[i];
+            }
+        });
+
+        // 3. Helper functions to classify joints
+        const isArm = (name) => {
+            let n = name.toLowerCase();
+            return n.includes('shoulder') || n.includes('elbow') || n.includes('radiocarpal') || n.includes('carpal');
+        };
+        const isHip = (name) => {
+            let n = name.toLowerCase();
+            return n.includes('hip') || n.includes('sacroiliac') || n.includes('pelvis');
+        };
+
+        // 4. Resolve conflicts
+        for (let vIdx in vertexWeights) {
+            let jDict = vertexWeights[vIdx];
+            let jointNames = Object.keys(jDict);
+            
+            let inArm = jointNames.some(isArm);
+            let inHip = jointNames.some(isHip);
+            
+            if (inArm && inHip) {
+                let x = coords[vIdx];
+                
+                // Compare distance from central Hip axis (~0.1) vs Arm axis (~0.2)
+                let distToHip = Math.abs(Math.abs(x) - 0.108);
+                let distToArm = Math.abs(Math.abs(x) - 0.206);
+                let isPhysicallyArm = distToArm < distToHip;
+                
+                jointNames.forEach(jName => {
+                    if (isPhysicallyArm && isHip(jName)) {
+                        delete jDict[jName]; // Remove hip weight from arm vertex
+                    } else if (!isPhysicallyArm && isArm(jName)) {
+                        delete jDict[jName]; // Remove arm weight from hip vertex
+                    }
+                });
+            }
+        }
+
+        // 5. Normalize remaining weights to exactly 1.0
+        for (let vIdx in vertexWeights) {
+            let jDict = vertexWeights[vIdx];
+            let totalWeight = 0;
+            
+            for (let jName in jDict) {
+                totalWeight += jDict[jName];
+            }
+            
+            if (totalWeight > 0) {
+                for (let jName in jDict) {
+                    jDict[jName] = jDict[jName] / totalWeight;
+                }
+            }
+        }
+
+        // 6. Write corrected strings back into the XML
+        joints.forEach(joint => {
+            if (!joint.hasAttribute('skinCoordIndex')) return;
+            
+            const origIndices = joint.getAttribute('skinCoordIndex').trim().split(/\s+/).map(Number);
+            const jointName = joint.getAttribute('name');
+            
+            let newIndices = [];
+            let newWeights = [];
+            
+            origIndices.forEach(vIdx => {
+                if (vertexWeights[vIdx] && vertexWeights[vIdx][jointName] !== undefined) {
+                    newIndices.push(vIdx);
+                    // Keep the floating point cleanly formatted
+                    newWeights.push(vertexWeights[vIdx][jointName].toFixed(5));
+                }
+            });
+            
+            if (newIndices.length > 0) {
+                joint.setAttribute('skinCoordIndex', newIndices.join(" "));
+                joint.setAttribute('skinCoordWeight', newWeights.join(" "));
+            } else {
+                // If a joint lost all its vertices during cleanup, remove the fields entirely
+                joint.removeAttribute('skinCoordIndex');
+                joint.removeAttribute('skinCoordWeight');
+            }
+        });
+    }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>X3D Skin Weight Line-of-Sight Culler</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; background: #f4f4f9; }
+        .container { max-width: 700px; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        button { padding: 10px 15px; background: #0078D7; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-top: 15px;}
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #status { margin-top: 20px; font-weight: bold; color: #333; }
+        .progress-bar { width: 100%; background: #eee; height: 10px; border-radius: 5px; margin-top: 10px; overflow: hidden; display: none; }
+        .progress-fill { height: 100%; background: #0078D7; width: 0%; transition: width 0.1s linear; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>X3D Rigging: Line-of-Sight Auto-Culler</h2>
+    <p>Select your X3D file. This script will:</p>
+    <ol>
+        <li>Cache existing joint weights and <b>strip all existing rigging fields</b> from the XML to ensure a clean slate.</li>
+        <li>Perform 3D Raycasting to cull occluded line-of-sight weights.</li>
+        <li>Preserve weights that fail line-of-sight ONLY if deleting them leaves the vertex completely orphaned.</li>
+        <li>Normalize standard joints to 1.0, assign all vertices to <b>humanoid_root</b> at 1.0, and inject the clean data back into the file.</li>
+    </ol>
+    
+    <input type="file" id="fileInput" accept=".x3d,.xml" />
+    <br>
+    <button id="processBtn" disabled>Process and Download</button>
+    <div id="status"></div>
+    <div class="progress-bar" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
+</div>
+
+<script>
+    const fileInput = document.getElementById('fileInput');
+    const processBtn = document.getElementById('processBtn');
+    const statusDiv = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
+    const progressFill = document.getElementById('progressFill');
+    let originalFilename = "fixed_model.x3d";
+
+    fileInput.addEventListener('change', function(e) {
+        if (e.target.files.length > 0) {
+            originalFilename = e.target.files[0].name.replace('.x3d', '_Culled.x3d');
+            processBtn.disabled = false;
+        }
+    });
+
+    processBtn.addEventListener('click', function() {
+        const file = fileInput.files[0];
+        const reader = new FileReader();
+        
+        statusDiv.innerText = "Parsing XML... Please wait.";
+        processBtn.disabled = true;
+        progressBar.style.display = 'block';
+        progressFill.style.width = '0%';
+        
+        reader.onload = async function(e) {
+            const parser = new DOMParser();
+            const xmlDoc = parser.parseFromString(e.target.result, "text/xml");
+            
+            try {
+                await cullOccludedWeights(xmlDoc);
+                
+                const serializer = new XMLSerializer();
+                let outStr = serializer.serializeToString(xmlDoc);
+                
+                if (!outStr.startsWith("<?xml")) {
+                    outStr = "<?xml version='1.0' encoding='utf-8'?>\n" + outStr;
+                }
+
+                const blob = new Blob([outStr], { type: "text/xml" });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = originalFilename;
+                a.click();
+                URL.revokeObjectURL(url);
+                
+                statusDiv.innerText = "Done! File downloaded as " + originalFilename;
+                progressFill.style.width = '100%';
+            } catch (err) {
+                console.error(err);
+                statusDiv.innerText = "Error processing file: " + err.message;
+            }
+            processBtn.disabled = false;
+        };
+        
+        reader.readAsText(file);
+    });
+
+    // --- Vector Math Helpers ---
+    function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+    function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+    function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+    function dist(a, b) { return Math.hypot(a[0]-b[0], a[1]-b[1], a[2]-b[2]); }
+    function normalize(a) { let len = Math.hypot(a[0], a[1], a[2]); return len === 0 ? [0,0,0] : [a[0]/len, a[1]/len, a[2]/len]; }
+
+    // --- Möller–Trumbore ray-triangle intersection ---
+    function intersectRayTriangle(O, D, V0, V1, V2) {
+        const EPSILON = 1e-6;
+        let edge1 = sub(V1, V0);
+        let edge2 = sub(V2, V0);
+        let h = cross(D, edge2);
+        let a = dot(edge1, h);
+        if (a > -EPSILON && a < EPSILON) return null; 
+        
+        let f = 1.0 / a;
+        let s = sub(O, V0);
+        let u = f * dot(s, h);
+        if (u < 0.0 || u > 1.0) return null;
+        
+        let q = cross(s, edge1);
+        let v = f * dot(D, q);
+        if (v < 0.0 || u + v > 1.0) return null;
+        
+        let t = f * dot(edge2, q);
+        if (t > EPSILON) return t; 
+        return null;
+    }
+
+    async function cullOccludedWeights(doc) {
+        // 1. Extract global coordinates
+        let coordNode = doc.querySelector('Coordinate[DEF="SkinCoord"]');
+        if (!coordNode) coordNode = doc.querySelector('Coordinate');
+        if (!coordNode) throw new Error("Could not find a <Coordinate> node in the X3D file.");
+
+        const pointsStr = coordNode.getAttribute('point').trim().split(/\s+/);
+        const vertices = [];
+        for (let i = 0; i < pointsStr.length; i += 3) {
+            vertices.push([parseFloat(pointsStr[i]), parseFloat(pointsStr[i+1]), parseFloat(pointsStr[i+2])]);
+        }
+        const totalVerticesCount = vertices.length;
+
+        // 2. Extract and triangulate all mesh faces for collision
+        const faceSets = doc.querySelectorAll('IndexedFaceSet');
+        const triangles = [];
+        faceSets.forEach(ifs => {
+            const coordIndexAttr = ifs.getAttribute('coordIndex');
+            if (!coordIndexAttr) return;
+            const indices = coordIndexAttr.trim().split(/\s+/).map(Number);
+            let poly = [];
+            for (let i = 0; i < indices.length; i++) {
+                if (indices[i] === -1) {
+                    for (let j = 1; j < poly.length - 1; j++) {
+                        triangles.push([poly[0], poly[j], poly[j+1]]);
+                    }
+                    poly = [];
+                } else {
+                    poly.push(indices[i]);
+                }
+            }
+        });
+
+        // 3. Precompute Axis-Aligned Bounding Boxes (AABB)
+        const triBounds = triangles.map(t => {
+            let v0 = vertices[t[0]], v1 = vertices[t[1]], v2 = vertices[t[2]];
+            return [
+                Math.min(v0[0], v1[0], v2[0]), Math.max(v0[0], v1[0], v2[0]),
+                Math.min(v0[1], v1[1], v2[1]), Math.max(v0[1], v1[1], v2[1]),
+                Math.min(v0[2], v1[2], v2[2]), Math.max(v0[2], v1[2], v2[2])
+            ];
+        });
+
+        // 4. Cache Weights and WIPEOUT Original DOM Attributes
+        const joints = doc.querySelectorAll('HAnimJoint');
+        let vertexWeights = {};
+        
+        joints.forEach(joint => {
+            const jName = joint.getAttribute('name');
+            const idxStr = joint.getAttribute('skinCoordIndex');
+            const wtStr = joint.getAttribute('skinCoordWeight');
+            
+            // Build memory map (excluding humanoid_root)
+            if (jName && jName.toLowerCase() !== 'humanoid_root' && idxStr && wtStr) {
+                const indices = idxStr.trim().split(/\s+/).map(Number);
+                const weights = wtStr.trim().split(/\s+/).map(Number);
+                
+                for (let i = 0; i < indices.length; i++) {
+                    let vIdx = indices[i];
+                    if (!vertexWeights[vIdx]) vertexWeights[vIdx] = {};
+                    vertexWeights[vIdx][jName] = weights[i];
+                }
+            }
+
+            // Immediately wipe out existing attributes to ensure a clean slate
+            joint.removeAttribute('skinCoordIndex');
+            joint.removeAttribute('skinCoordWeight');
+        });
+
+        // 5. Check Line-of-Sight & track Occlusions
+        let occlusions = {}; 
+
+        for (let i = 0; i < joints.length; i++) {
+            let joint = joints[i];
+            let jName = joint.getAttribute('name');
+            
+            if (!jName || jName.toLowerCase() === 'humanoid_root') continue;
+
+            let centerStr = joint.getAttribute('center') || "0 0 0";
+            let JC = centerStr.trim().split(/\s+/).map(Number);
+            
+            let assignedVertices = [];
+            for (let vIdx in vertexWeights) {
+                if (vertexWeights[vIdx][jName] !== undefined) {
+                    assignedVertices.push(parseInt(vIdx));
+                }
+            }
+
+            statusDiv.innerText = `Raycasting joint ${i+1} of ${joints.length} (${jName})...`;
+            progressFill.style.width = `${(i / joints.length) * 100}%`;
+            await new Promise(r => setTimeout(r, 0)); 
+
+            for (let vIdx of assignedVertices) {
+                let VTarget = vertices[vIdx];
+                let maxDist = dist(JC, VTarget);
+                let dir = normalize(sub(VTarget, JC));
+                
+                let segMinX = Math.min(JC[0], VTarget[0]) - 0.001; let segMaxX = Math.max(JC[0], VTarget[0]) + 0.001;
+                let segMinY = Math.min(JC[1], VTarget[1]) - 0.001; let segMaxY = Math.max(JC[1], VTarget[1]) + 0.001;
+                let segMinZ = Math.min(JC[2], VTarget[2]) - 0.001; let segMaxZ = Math.max(JC[2], VTarget[2]) + 0.001;
+
+                let occluded = false;
+
+                for (let tIdx = 0; tIdx < triangles.length; tIdx++) {
+                    let tri = triangles[tIdx];
+                    if (tri[0] === vIdx || tri[1] === vIdx || tri[2] === vIdx) continue;
+
+                    let b = triBounds[tIdx];
+                    if (segMaxX < b[0] || segMinX > b[1] || segMaxY < b[2] || segMinY > b[3] || segMaxZ < b[4] || segMinZ > b[5]) continue;
+
+                    let v0 = vertices[tri[0]], v1 = vertices[tri[1]], v2 = vertices[tri[2]];
+                    let t = intersectRayTriangle(JC, dir, v0, v1, v2);
+
+                    if (t !== null && t > 0.0001 && t < maxDist - 0.001) {
+                        occluded = true;
+                        break; 
+                    }
+                }
+
+                if (occluded) {
+                    if (!occlusions[vIdx]) occlusions[vIdx] = [];
+                    occlusions[vIdx].push(jName);
+                }
+            }
+        }
+
+        statusDiv.innerText = `Resolving occlusions and normalizing...`;
+        await new Promise(r => setTimeout(r, 0));
+
+        // 6. Process Occlusions & Apply "Orphan" Exception
+        let culledCount = 0;
+        let ruleBreaks = 0;
+
+        for (let vIdx in occlusions) {
+            let occludedJoints = occlusions[vIdx];
+            let allAssignedJoints = Object.keys(vertexWeights[vIdx]);
+
+            if (occludedJoints.length === allAssignedJoints.length) {
+                // Break the rule: Keep the strongest joint so vertex isn't orphaned
+                let bestJoint = occludedJoints[0];
+                let maxWeight = vertexWeights[vIdx][bestJoint];
+                
+                for (let j = 1; j < occludedJoints.length; j++) {
+                    let w = vertexWeights[vIdx][occludedJoints[j]];
+                    if (w > maxWeight) { maxWeight = w; bestJoint = occludedJoints[j]; }
+                }
+
+                for (let jName of occludedJoints) {
+                    if (jName !== bestJoint) {
+                        delete vertexWeights[vIdx][jName];
+                        culledCount++;
+                    }
+                }
+                ruleBreaks++;
+            } else {
+                // Vertex has at least one valid joint. Safe to delete all occlusions.
+                for (let jName of occludedJoints) {
+                    delete vertexWeights[vIdx][jName];
+                    culledCount++;
+                }
+            }
+        }
+
+        console.log(`Culled ${culledCount} invalid weights. Ignored single-intersection rule for ${ruleBreaks} orphaned vertices.`);
+
+        // 7. Normalize remaining standard weights to 1.0 & build Output Dictionary
+        let finalJointData = {}; // Format: { JointName : { indices: [], weights: [] } }
+
+        for (let vIdx in vertexWeights) {
+            let jDict = vertexWeights[vIdx];
+            let totalWeight = 0;
+            
+            for (let jName in jDict) totalWeight += jDict[jName];
+            
+            if (totalWeight > 0) {
+                for (let jName in jDict) {
+                    let normWeight = jDict[jName] / totalWeight;
+                    
+                    if (!finalJointData[jName]) finalJointData[jName] = { indices: [], weights: [] };
+                    finalJointData[jName].indices.push(vIdx);
+                    finalJointData[jName].weights.push(normWeight.toFixed(5));
+                }
+            }
+        }
+
+        const allVerticesArray = Array.from({length: totalVerticesCount}, (_, i) => i);
+
+        // 8. Re-inject Cleaned Data into XML
+        joints.forEach(joint => {
+            const jointName = joint.getAttribute('name');
+            if (!jointName) return;
+            
+            // --- Special Rule for humanoid_root ---
+            if (jointName.toLowerCase() === 'humanoid_root') {
+                if (totalVerticesCount > 0) {
+                    joint.setAttribute('skinCoordIndex', allVerticesArray.join(" "));
+                    joint.setAttribute('skinCoordWeight', allVerticesArray.map(() => "1.0").join(" "));
+                }
+                return; 
+            }
+
+            // --- Standard Joints ---
+            if (finalJointData[jointName] && finalJointData[jointName].indices.length > 0) {
+                joint.setAttribute('skinCoordIndex', finalJointData[jointName].indices.join(" "));
+                joint.setAttribute('skinCoordWeight', finalJointData[jointName].weights.join(" "));
+            }
+            // Joints with no remaining vertices naturally stay empty since we stripped them in Step 4.
+        });
+    }
+</script>
+
+</body>
+</html>

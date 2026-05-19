@@ -1,0 +1,91 @@
+Here is the full technical specification for the X3D Skin Weight Line-of-Sight Culler, detailing its architecture, processing rules, mathematical models, and edge-case handling.
+Software Specification: X3D Skin Weight Line-of-Sight Culler
+1. Overview
+
+The X3D Skin Weight Line-of-Sight Culler is a client-side, browser-based JavaScript tool designed to clean and optimize standard H-Anim rigging within X3D files. It solves the problem of "weight bleeding"—where skin vertices are incorrectly influenced by bones located across mesh folds or boundaries (e.g., an arm bone accidentally pulling vertices on the torso). It achieves this by performing 3D raycast line-of-sight checks between skeletal joint centers and skin vertices.
+2. Inputs & Outputs
+
+    Input: A valid .x3d or .xml file containing:
+
+        A skin geometry defined by an <IndexedFaceSet> and a <Coordinate> node.
+
+        An H-Anim skeleton defined by <HAnimJoint> nodes containing center, skinCoordIndex, and skinCoordWeight attributes.
+
+    Output: A processed .x3d file appended with _Culled.x3d, triggered as a browser download.
+
+    Execution: 100% client-side via HTML5 FileReader and DOM APIs. No server processing is involved.
+
+3. Core Processing Rules
+Phase 1: Geometry & Topology Parsing
+
+    Vertex Extraction: Locates the primary skin coordinates (defaults to Coordinate[DEF="SkinCoord"], falls back to the first <Coordinate>) and maps them into a 3D array [x, y, z].
+
+    Mesh Triangulation: Iterates through all <IndexedFaceSet> nodes. Polygons defined by coordIndex (separated by -1) are triangulated. N-gons (faces with >3 vertices) are broken down into triangles using a standard triangle fan algorithm.
+
+    Spatial Optimization (AABB): Generates Axis-Aligned Bounding Boxes (AABBs) for every individual triangle to optimize raycast collision detection later in the pipeline.
+
+Phase 2: Raycast Line-of-Sight Culling
+
+For every <HAnimJoint> (excluding the root), the script evaluates its relationship with every vertex listed in its skinCoordIndex.
+
+    Ray Trajectory: A 3D vector ray is cast from the joint's center coordinates directly to the target vertex's [x, y, z] coordinates.
+
+    Mesh Intersection Rule: The ray must only touch the joint center and the target vertex.
+
+    Collision Checking:
+
+        The script uses the Möller–Trumbore intersection algorithm to test if the ray hits any mesh triangle.
+
+        Triangles that actually contain the target vertex are ignored.
+
+        If the ray intersects a triangle at a distance greater than 0.0001 (to prevent self-intersection at the origin) and less than the total distance to the target vertex minus 0.001 (to prevent endpoint surface clipping), the path is deemed occluded (blocked by a mesh fold or boundary).
+
+    Flagging: Weights determined to cross a boundary are flagged for removal.
+
+Phase 3: The "Orphan" Fallback (Single Intersection Rule Break)
+
+Vertices must not be left entirely without standard joint influence.
+
+    After raycasting, the script checks the occlusion flags for every vertex.
+
+    Normal Condition: If a vertex has at least one valid, unoccluded joint, all occluded joint weights are permanently deleted.
+
+    Fallback Condition: If all joints tied to a specific vertex are flagged as occluded (e.g., a vertex deep in an armpit crease), the script breaks the intersection rule. It finds the blocked joint that had the highest original weight and preserves it, deleting the rest. This ensures no vertex becomes an "orphan."
+
+Phase 4: Weight Normalization
+
+After invalid weights are culled, the remaining standard joint weights assigned to a given vertex are recalculated.
+
+    Formula: New_Weight = Joint_Weight / Sum_of_Remaining_Weights
+
+    Result: The total sum of standard joint weights for every vertex will perfectly equal 1.0.
+
+Phase 5: Root Joint Override
+
+The humanoid_root joint fundamentally controls the global transform of the character and must influence the entire skin.
+
+    The script identifies the root joint by looking for <HAnimJoint name="humanoid_root"> (case-insensitive).
+
+    Regardless of previous rig data, the script completely overwrites this joint's skin attributes.
+
+    It assigns an index for every single vertex in the mesh (0 through TotalVertices - 1) to the root's skinCoordIndex.
+
+    It assigns a weight of exactly 1.0 to every vertex in the root's skinCoordWeight.
+
+    Final Rig State: Every vertex in the mesh possesses a total weight sum of 2.0 (1.0 from normalized standard bones + 1.0 from the humanoid_root).
+
+4. Mathematical Algorithms Used
+
+    Vector Operations: Custom, lightweight JS implementations of Vector Subtraction, Cross Product, Dot Product, Distance (Math.hypot), and Normalization.
+
+    Möller–Trumbore Algorithm: Used for fast ray-triangle intersection calculation in 3D space, yielding the exact scalar distance (t) to the impact point.
+
+    AABB Pre-screening: Before running the heavy Möller–Trumbore math, the script checks if the bounding box of the ray segment overlaps the bounding box of a given triangle. This reduces computation time by roughly 90%.
+
+5. File & Schema Assumptions
+
+    Joint Names: Root joint must be named humanoid_root to trigger Phase 5 overrides. Other joints are processed generically.
+
+    Float Formatting: Output weights are rounded and serialized to 5 decimal places (e.g., 0.33333) to maintain cleanliness in the XML without sacrificing precision.
+
+    XML Structure: Assumes standard X3D node capitalization (<HAnimJoint>, <Coordinate>, <IndexedFaceSet>). If a joint loses all its vertices during culling, the skinCoordIndex and skinCoordWeight attributes are cleanly removed from that node.

@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>X3D Rig Fixer: Hierarchy Region Enforcer v17</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; background: #f4f4f9; }
+        .container { max-width: 780px; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        button { padding: 10px 15px; background: #0078D7; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-top: 15px; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .options { margin-top: 15px; padding: 15px; background: #eef; border-radius: 4px; border: 1px solid #ccd; }
+        label { display: block; margin-bottom: 4px; cursor: pointer; font-weight: bold; }
+        .help-text { font-size: 13px; color: #555; margin-bottom: 10px; margin-left: 20px; display: block; }
+        #status { margin-top: 20px; font-weight: bold; color: #333; line-height: 1.6; white-space: pre-wrap; }
+        .progress-bar { width: 100%; background: #ddd; height: 12px; border-radius: 6px; margin-top: 10px; overflow: hidden; display: none; }
+        .progress-fill { height: 100%; background: #0078D7; width: 0%; transition: width 0.15s linear; }
+        .tag { display: inline-block; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 3px;
+               font-size: 11px; font-family: monospace; padding: 1px 5px; margin: 1px; }
+        .tag.arm { background: #d0e8ff; border-color: #9ec5fe; }
+        .tag.leg { background: #fde8d0; border-color: #fec99e; }
+        #regionReport { margin-top: 14px; font-size: 12px; font-family: monospace; color: #333; max-height: 200px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; border-radius: 4px; display: none; background: #fafafa; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>X3D Rigging Fixer: Hierarchy Region Enforcer v17</h2>
+    <p>
+        Reads the actual <b>HAnim joint hierarchy</b> (parent→child XML nesting) to
+        classify every joint as <b class="tag arm">ARM</b> (elbow and below) or
+        <b class="tag leg">LEG</b> (hip and below).  Any vertex influenced by joints
+        from both regions has the <em>minority-weight region stripped</em> — no
+        raycasting, no air-gap tolerance to tune.
+    </p>
+
+    <div class="options">
+        <label>Arm region root joints (comma-separated HAnim names):</label>
+        <input type="text" id="armRoots" value="l_elbow, r_elbow" style="width:100%; box-sizing:border-box; font-family:monospace;">
+        <span class="help-text">Everything from these joints <em>downward</em> in the hierarchy is treated as "arm".
+            Use <code>l_shoulder, r_shoulder</code> to include shoulders. Default starts at the elbow.</span>
+
+        <label style="margin-top:10px;">Leg region root joints (comma-separated HAnim names):</label>
+        <input type="text" id="legRoots" value="l_hip, r_hip" style="width:100%; box-sizing:border-box; font-family:monospace;">
+        <span class="help-text">Everything from these joints <em>downward</em> (knee, ankle, toes…) is "leg".</span>
+
+        <label style="margin-top:10px;">
+            <input type="checkbox" id="yFallback" checked>
+            Also strip arm weights from vertices below waist (safety net)
+        </label>
+        <span class="help-text">
+            If the original file had vertices assigned <em>only</em> to arm joints but they sit below the
+            waist joint (vl5 / sacrum / pelvis), strip those arm weights too.  Catches badly-bled rigs
+            where even the minority test can't fire because no leg weight survived.
+        </span>
+    </div>
+
+    <input type="file" id="fileInput" accept=".x3d,.xml" />
+    <br>
+    <button id="processBtn" disabled>Process and Download</button>
+    <div id="status"></div>
+    <div class="progress-bar" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
+    <div id="regionReport"></div>
+</div>
+
+<script>
+    const fileInput  = document.getElementById('fileInput');
+    const processBtn = document.getElementById('processBtn');
+    const statusDiv  = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
+    const progressFill = document.getElementById('progressFill');
+    const regionReport = document.getElementById('regionReport');
+    let originalFilename = "fixed_model.x3d";
+
+    fileInput.addEventListener('change', e => {
+        if (e.target.files.length > 0) {
+            originalFilename = e.target.files[0].name.replace(/\.x3d$/i, '_Hier17.x3d');
+            processBtn.disabled = false;
+        }
+    });
+
+    processBtn.addEventListener('click', async function () {
+        const file = fileInput.files[0];
+        const reader = new FileReader();
+        processBtn.disabled = true;
+        statusDiv.innerText = "Parsing XML…";
+        progressBar.style.display = 'block';
+        progressFill.style.width = '5%';
+        regionReport.style.display = 'none';
+        regionReport.innerHTML = '';
+
+        const armRootInput = document.getElementById('armRoots').value
+            .split(',').map(s => s.trim()).filter(Boolean);
+        const legRootInput = document.getElementById('legRoots').value
+            .split(',').map(s => s.trim()).filter(Boolean);
+        const useYFallback = document.getElementById('yFallback').checked;
+
+        reader.onload = async function (e) {
+            const parser = new DOMParser();
+            const xmlDoc = parser.parseFromString(e.target.result, "text/xml");
+            try {
+                await processRigging(xmlDoc, armRootInput, legRootInput, useYFallback);
+
+                const serializer = new XMLSerializer();
+                let outStr = serializer.serializeToString(xmlDoc);
+                if (!outStr.startsWith("<?xml")) outStr = "<?xml version='1.0' encoding='utf-8'?>\n" + outStr;
+
+                const blob = new Blob([outStr], { type: "text/xml" });
+                const url  = URL.createObjectURL(blob);
+                const a    = document.createElement('a');
+                a.href = url; a.download = originalFilename; a.click();
+                URL.revokeObjectURL(url);
+
+                statusDiv.innerHTML += `\n<span style="color:green;">✓ Done — saved as ${originalFilename}</span>`;
+                progressFill.style.width = '100%';
+            } catch (err) {
+                console.error(err);
+                statusDiv.innerHTML += `\n<span style="color:red;">Error: ${err.message}</span>`;
+            }
+            processBtn.disabled = false;
+        };
+        reader.readAsText(file);
+    });
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+    function parseFloatArray(str) {
+        if (!str) return [];
+        return str.replace(/,/g, ' ').trim().split(/\s+/).filter(Boolean).map(Number);
+    }
+
+    // ── Joint tree builder ─────────────────────────────────────────────────────
+    // Reads XML nesting to produce { name → { element, parent, children[] } }
+    function buildJointTree(doc) {
+        const map = {};
+        doc.querySelectorAll('HAnimJoint').forEach(el => {
+            const name = el.getAttribute('name');
+            if (name) map[name] = { element: el, parent: null, children: [] };
+        });
+
+        doc.querySelectorAll('HAnimJoint').forEach(el => {
+            const name = el.getAttribute('name');
+            if (!name) return;
+            // Walk up the DOM to find the nearest ancestor HAnimJoint
+            let cursor = el.parentElement;
+            while (cursor) {
+                if (cursor.tagName === 'HAnimJoint') {
+                    const pName = cursor.getAttribute('name');
+                    if (pName && map[pName]) {
+                        map[name].parent = pName;
+                        map[pName].children.push(name);
+                    }
+                    break;
+                }
+                cursor = cursor.parentElement;
+            }
+        });
+        return map;
+    }
+
+    // BFS downward from rootName — returns Set of all joint names in subtree (inclusive)
+    function subtree(tree, rootName) {
+        const result = new Set();
+        const queue  = [rootName];
+        while (queue.length) {
+            const n = queue.shift();
+            if (!n || result.has(n) || !tree[n]) continue;
+            result.add(n);
+            tree[n].children.forEach(c => queue.push(c));
+        }
+        return result;
+    }
+
+    // ── Main ───────────────────────────────────────────────────────────────────
+    async function processRigging(doc, armRootNames, legRootNames, useYFallback) {
+
+        // 1. Master vertex list
+        let masterCoordNode = doc.querySelector('Coordinate[DEF="SkinCoord"]');
+        if (!masterCoordNode) {
+            let maxLen = 0;
+            doc.querySelectorAll('Coordinate').forEach(c => {
+                const s = c.getAttribute('point') || '';
+                if (s.length > maxLen) { maxLen = s.length; masterCoordNode = c; }
+            });
+        }
+        if (!masterCoordNode) throw new Error("No <Coordinate> node found.");
+
+        const rawPts = parseFloatArray(masterCoordNode.getAttribute('point'));
+        const vertices = [];
+        for (let i = 0; i + 2 < rawPts.length; i += 3)
+            vertices.push([rawPts[i], rawPts[i+1], rawPts[i+2]]);
+        const totalV = vertices.length;
+
+        statusDiv.innerText = `Parsed ${totalV} vertices.  Building joint tree…`;
+        await tick();
+
+        // 2. Build hierarchy
+        const tree   = buildJointTree(doc);
+        const joints = doc.querySelectorAll('HAnimJoint');
+
+        // 3. Collect arm and leg subtrees
+        const armSet = new Set();
+        const legSet = new Set();
+
+        armRootNames.forEach(r => subtree(tree, r).forEach(j => armSet.add(j)));
+        legRootNames.forEach(r => subtree(tree, r).forEach(j => legSet.add(j)));
+
+        // Sanity report
+        const armList = [...armSet].sort();
+        const legList = [...legSet].sort();
+        statusDiv.innerText =
+            `ARM joints (${armList.length}): ${armList.join(', ')}\n` +
+            `LEG joints (${legList.length}): ${legList.join(', ')}\n` +
+            `Building weight table…`;
+        await tick();
+
+        // 4. Load all weights from DOM into vertexWeights map, then clear DOM attrs
+        const vertexWeights = {};   // { vIdx: { jointName: weight } }
+
+        joints.forEach(joint => {
+            const jName  = joint.getAttribute('name');
+            const idxStr = joint.getAttribute('skinCoordIndex');
+            const wtStr  = joint.getAttribute('skinCoordWeight');
+            if (jName && idxStr && wtStr) {
+                const idxs = parseFloatArray(idxStr);
+                const wts  = parseFloatArray(wtStr);
+                for (let i = 0; i < idxs.length; i++) {
+                    const vi = idxs[i];
+                    if (vi >= 0 && vi < totalV && wts[i] !== undefined) {
+                        if (!vertexWeights[vi]) vertexWeights[vi] = {};
+                        vertexWeights[vi][jName] = (vertexWeights[vi][jName] || 0) + wts[i];
+                    }
+                }
+            }
+            joint.removeAttribute('skinCoordIndex');
+            joint.removeAttribute('skinCoordWeight');
+        });
+
+        progressFill.style.width = '40%';
+        statusDiv.innerText += `\nWeights loaded.  Enforcing region rules…`;
+        await tick();
+
+        // 5. Determine waist Y for the Y-fallback
+        let waistY = null;
+        if (useYFallback) {
+            const WAIST_NAMES = ['vl5','vl4','vl3','sacrum','pelvis'];
+            const nameMap = {};
+            joints.forEach(j => {
+                const n = (j.getAttribute('name') || '').toLowerCase();
+                const c = parseFloatArray(j.getAttribute('center') || '0 0 0');
+                if (c.length >= 3) nameMap[n] = c[1];
+            });
+            for (const n of WAIST_NAMES) {
+                if (nameMap[n] !== undefined) { waistY = nameMap[n]; break; }
+            }
+            if (waistY === null) {
+                // Fallback: midpoint between lowest arm-chain Y and highest leg-chain Y
+                let armYs = [], legYs = [];
+                joints.forEach(j => {
+                    const n = j.getAttribute('name') || '';
+                    const c = parseFloatArray(j.getAttribute('center') || '0 0 0');
+                    if (c.length < 3) return;
+                    if (armSet.has(n)) armYs.push(c[1]);
+                    if (legSet.has(n)) legYs.push(c[1]);
+                });
+                if (armYs.length && legYs.length)
+                    waistY = (Math.min(...armYs) + Math.max(...legYs)) / 2;
+            }
+        }
+
+        // 6. Region enforcement
+        let crossStripped    = 0;   // vertices fixed by cross-region rule
+        let yFallbackStripped = 0;  // vertices fixed by Y-fallback
+
+        for (const vi in vertexWeights) {
+            const vj = vertexWeights[vi];
+            const names = Object.keys(vj);
+
+            let armSum = 0, legSum = 0;
+            for (const n of names) {
+                if (armSet.has(n)) armSum += vj[n];
+                if (legSet.has(n)) legSum += vj[n];
+            }
+
+            if (armSum > 0 && legSum > 0) {
+                // Vertex has weights in BOTH regions — strip the minority side.
+                // Ties go to leg (the reported problem is arms pulling legs, not vice versa).
+                const stripArm = (legSum >= armSum);
+                for (const n of names) {
+                    if (stripArm  && armSet.has(n)) { delete vj[n]; crossStripped++; }
+                    if (!stripArm && legSet.has(n)) { delete vj[n]; crossStripped++; }
+                }
+            } else if (armSum > 0 && legSum === 0 && useYFallback && waistY !== null) {
+                // Vertex has ONLY arm weights.  If it sits below the waist, those arm weights
+                // are orphaned bleed-through — the air-gap test (in a previous pass) or a
+                // bad rig already stripped the legitimate leg weights.  Strip arm weights too.
+                const vy = vertices[parseInt(vi)][1];
+                if (vy < waistY) {
+                    for (const n of [...names]) {
+                        if (armSet.has(n)) { delete vj[n]; yFallbackStripped++; }
+                    }
+                }
+            }
+        }
+
+        progressFill.style.width = '70%';
+        statusDiv.innerText += `\nCross-region stripped: ${crossStripped}  Y-fallback: ${yFallbackStripped}\nNormalising & writing output…`;
+        await tick();
+
+        // 7. Normalise weights and write back into DOM
+        const finalData = {};   // { jointName: { indices:[], weights:[] } }
+
+        for (const vi in vertexWeights) {
+            const vj = vertexWeights[vi];
+            let total = 0;
+            for (const n in vj) total += vj[n];
+            if (total <= 0) continue;
+            for (const n in vj) {
+                const w = vj[n] / total;
+                if (!finalData[n]) finalData[n] = { indices: [], weights: [] };
+                finalData[n].indices.push(vi);
+                finalData[n].weights.push(w.toFixed(5));
+            }
+        }
+
+        // humanoid_root gets all vertices at weight 1.0 (unchanged behaviour)
+        const allIdx = Array.from({ length: totalV }, (_, i) => i);
+        joints.forEach(joint => {
+            const jn = joint.getAttribute('name');
+            if (!jn) return;
+            if (jn.toLowerCase() === 'humanoid_root') {
+                joint.setAttribute('skinCoordIndex',  allIdx.join(' '));
+                joint.setAttribute('skinCoordWeight', allIdx.map(() => '1.0').join(' '));
+                return;
+            }
+            const d = finalData[jn];
+            if (d && d.indices.length > 0) {
+                joint.setAttribute('skinCoordIndex',  d.indices.join(' '));
+                joint.setAttribute('skinCoordWeight', d.weights.join(' '));
+            }
+        });
+
+        progressFill.style.width = '95%';
+
+        // 8. Build region report for UI
+        const reportLines = [
+            `ARM subtree  (root: ${armRootNames.join(', ')})  — ${armList.length} joints`,
+            armList.map(n => `  • ${n}`).join('\n'),
+            '',
+            `LEG subtree  (root: ${legRootNames.join(', ')})  — ${legList.length} joints`,
+            legList.map(n => `  • ${n}`).join('\n'),
+            '',
+            `Waist Y boundary: ${waistY !== null ? waistY.toFixed(4) + ' m' : 'N/A'}`,
+            `Cross-region weights removed : ${crossStripped}`,
+            `Y-fallback  weights removed  : ${yFallbackStripped}`,
+            `Total vertices               : ${totalV}`,
+        ];
+        regionReport.style.display = 'block';
+        regionReport.innerText = reportLines.join('\n');
+
+        console.log(reportLines.join('\n'));
+    }
+
+    function tick() { return new Promise(r => setTimeout(r, 0)); }
+</script>
+
+</body>
+</html>

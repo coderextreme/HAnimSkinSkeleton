@@ -1,0 +1,123 @@
+Project Specification: X3D AutoRigger
+1. Introduction
+
+Project Name: X3D AutoRigger
+Description: A Python-based command-line utility designed to automatically merge a static 3D mesh (the "skin") with a pre-animated humanoid skeleton. The system aligns their scales, calculates bind weights using distance-based falloff algorithms, preserves all skeleton animations, and outputs a fully rigged, X3D 4.0 and HAnim 2.0 compliant humanoid file.
+2. Objectives
+
+    Automation: Eliminate the need for manual weight painting and bone alignment for standardized HAnim humanoids.
+
+    Animation Preservation: Ensure that all original skeleton animations (interpolators, timers, routes) are carried over perfectly to the rigged mesh.
+
+    Standardization: Output files that conform strictly to the Extensible 3D (X3D) version 4.0 and Humanoid Animation (HAnim) version 2.0 specifications.
+
+3. System Architecture & Workflow
+
+The system operates sequentially in five major phases:
+Phase 1: Parsing & Extraction
+
+    Skin File Input: Parses the skin.x3d file. Locates the IndexedFaceSet and Coordinate nodes. Extracts the 3D vertex data into a flattened numerical array.
+
+    Skeleton File Input: Parses the skeleton.x3d file. Locates the HAnimHumanoid node.
+
+    Geometry Stripping: Iterates through the skeleton tree and removes existing geometry (Shape, Appearance, IndexedFaceSet, etc.) while explicitly preserving structural and animation nodes (HAnimJoint, TimeSensor, Group, PositionInterpolator, OrientationInterpolator, ROUTE).
+
+Phase 2: Scale & Space Alignment
+
+    Bounding Box Calculation: Calculates the Y-axis bounding box height for both the skin mesh and the skeleton.
+
+    Scale Factor Application: Determines the ratio between the skin and skeleton heights. Multiplies the skeleton's translation and center values by this scale factor.
+
+    Animation Scaling: Scales the keyValue attributes of PositionInterpolator nodes to ensure that translational animations (like walking/jumping) correctly match the newly scaled skeleton.
+
+Phase 3: Forward Kinematics (FK)
+
+    World Position Reconstruction: Traverses the HAnimJoint hierarchy. Accumulates center/translation vectors to compute absolute world-space coordinates for each joint.
+
+    Bone Segment Mapping: Creates geometric line segments representing the "bones" by linking each parent joint's world position to its immediate child joint's world position.
+
+Phase 4: Skin Weight Calculation
+
+    Distance Calculation: Utilizes vectorized NumPy operations to calculate the shortest distance from every vertex to every bone line segment.
+
+    Quadratic Falloff: Calculates a bind weight using an envelope radius (dynamically set to 15% of the body's total height). Uses a quadratic falloff formula:
+
+            
+    W=max(0,1−(dist/radius)2)
+    W=max(0,1−(dist/radius)2)
+
+          
+
+    .
+
+    Top-4 Pruning: Prunes the weight matrix so that each vertex is influenced by a maximum of 4 bones. Vertices entirely outside all envelopes fallback to the nearest absolute joint.
+
+    Normalization: Renormalizes the remaining weights so they equal 1.0 per vertex.
+
+    Mapping: Writes the resulting active weights into the skinCoordIndex and skinCoordWeight attributes of their respective HAnimJoint elements.
+
+Phase 5: Cleanup, Merging & Exporting
+
+    Node Assembly: Assembles the skin geometry inside the HAnimHumanoid node using standard X3D containerField designations (skin, skinCoord).
+
+    Reference Lists: Generates flat X3D definition lists for joints, segments, and sites within the humanoid node.
+
+    Tree Cleanup:
+
+        Finds all HAnimSegment and HAnimSite elements and permanently deletes any Transform elements nested beneath them.
+
+        Resolves XML mutually exclusive DEF and USE overlaps (a node cannot act as a definition and a reference simultaneously).
+
+        Removes orphaned USE nodes pointing to DEF IDs that no longer exist due to geometry stripping.
+
+    Export: Saves the preserved skeleton X3D tree (now featuring the bound mesh) to the output X3D file.
+
+4. Technical Specifications
+4.1. Requirements
+
+    Language: Python 3.7+
+
+    Dependencies:
+
+        numpy (for vectorized distance calculations and matrix manipulation).
+
+        xml.etree.ElementTree (standard library, for XML/X3D parsing and manipulation).
+
+        copy, sys (standard library).
+
+4.2. Input Data Format
+
+    Skin File: A valid XML-encoded .x3d file. Must contain at least one Shape encompassing an IndexedFaceSet and a Coordinate node.
+
+    Skeleton File: A valid XML-encoded .x3d file. Must contain a HAnimHumanoid node containing a nested hierarchy of HAnimJoint nodes, and may contain associated animation logic (ROUTE, interpolators).
+
+4.3. Output Data Format
+
+    Output File: A valid XML-encoded .x3d file with the <X3D> root tag attributes set to profile="Immersive" and version="4.0". The internal HAnimHumanoid will have version="2.0".
+
+4.4. Interface / CLI
+
+The application is executed via the command line interface:
+code Bash
+
+python x3d_autorigger.py <input_skin.x3d> <input_skeleton.x3d> <output_rigged.x3d>
+
+5. Performance & Constraints
+
+    Execution Time: The dominant computational factor is calculating the point-to-line distances. By using NumPy vectorization, processing a standard mesh (e.g., 5,000 to 20,000 vertices) and an HAnim skeleton (~70-90 joints) will process in under a few seconds on typical hardware.
+
+    Memory Footprint: Designed to be lightweight. The entire X3D tree and weight matrices are held in RAM, requiring <100MB of memory for standard models.
+
+    Limitations:
+
+        The skin geometry must represent a model in a "Bind Pose" (typically a T-pose or A-pose) that roughly matches the bind pose of the input skeleton.
+
+        X3D node parsing looks for the first valid IndexedFaceSet in the skin file; files containing multiple separate body shapes (e.g., separate head, body, clothes geometries) are currently unsupported without prior merging in 3D modeling software.
+
+6. Future Expansion / Scalability
+
+    Multi-Mesh Support: Future versions could aggregate multiple Shape or IndexedFaceSet nodes into a single coordinate array before rigging.
+
+    Advanced Falloff Envelopes: Allowing variable envelope radii based on specific bone names (e.g., smaller falloff for finger bones, larger for torso bones).
+
+    Bind Pose Correction: Incorporating an automated affine transformation matrix to align the mesh to the skeleton if their resting axes or orientations differ prior to the scaling step.
